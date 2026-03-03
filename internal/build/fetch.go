@@ -17,6 +17,10 @@ type FetchConfig struct {
 	BalTimeout    time.Duration
 	LeaseTimeout  time.Duration
 	TenantTimeout time.Duration
+
+	// ExistingLeaseIDs is a map of Lease IDs currently in the Google Sheet.
+	// If a lease has a zero balance but is in this map, we process it so its balance updates to 0.
+	ExistingLeaseIDs map[int]bool
 }
 
 type DelinquentRow struct {
@@ -58,7 +62,15 @@ func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfi
 
 	for _, lease := range leases {
 		owed := debtMap[lease.ID]
-		if owed <= 0 {
+
+		isExisting := false
+		if cfg.ExistingLeaseIDs != nil {
+			isExisting = cfg.ExistingLeaseIDs[lease.ID]
+		}
+
+		// Only process if they owe money, or if they are already on the sheet
+		// (meaning they might have paid off their balance and we need to update to 0).
+		if owed <= 0 && !isExisting {
 			continue
 		}
 

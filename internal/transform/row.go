@@ -1,6 +1,7 @@
 package transform
 
 import (
+	"strings"
 	"time"
 
 	"github.com/Berry-rock-code/collections-sync/internal/build"
@@ -9,32 +10,35 @@ import (
 func ToSheetValues(rows []build.DelinquentRow) [][]interface{} {
 	headers := Headers()
 
+	// Create a map of header names to their FIRST occurrence index
+	headerIndices := make(map[string]int)
+	for i, h := range headers {
+		lowerH := strings.TrimSpace(strings.ToLower(h))
+		if _, exists := headerIndices[lowerH]; !exists {
+			headerIndices[lowerH] = i
+		}
+	}
+
 	out := make([][]interface{}, 0, len(rows))
 	now := time.Now().Format(time.RFC3339)
 
 	for _, r := range rows {
 		row := make([]interface{}, len(headers))
 
-		// Map into known columns by position (matching Headers()).
-		// 0 Name
-		row[0] = r.Name
-		// 1 Address:
-		row[1] = r.Address
-		// 2 Phone Number
-		row[2] = r.Phone
-		// 3 Email
-		row[3] = r.Email
-		// 4 Amount Owed:
-		row[4] = r.AmountOwed
+		setValue := func(headerName string, value interface{}) {
+			idx, ok := headerIndices[strings.TrimSpace(strings.ToLower(headerName))]
+			if ok && idx < len(row) {
+				row[idx] = value
+			}
+		}
 
-		// 13 Last Edited Date
-		row[13] = now
-
-		// 23 Lease ID
-		row[23] = r.LeaseID
-
-		// 24 Phone Number (duplicate column if your sheet has it)
-		row[24] = r.Phone
+		setValue("Name", r.Name)
+		setValue("Address:", r.Address)
+		setValue("Phone Number", r.Phone)
+		setValue("Email", r.Email)
+		setValue("Amount Owed:", r.AmountOwed)
+		setValue("Last Edited Date", now)
+		setValue("Lease ID", r.LeaseID)
 
 		out = append(out, row)
 	}

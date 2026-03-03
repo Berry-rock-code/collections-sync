@@ -30,7 +30,7 @@ func Headers() []string {
 		"Eviction Filed Date",
 		"Eviction Court Date",
 		"Lease ID",
-		"Phone Number", // appears twice in your list; keep if the sheet really has it
+		"Phone Number", // appears twice in the list; kept for consistency with the actual sheet
 		"Date Status Changed to Eviction",
 	}
 }
