@@ -95,9 +95,15 @@ func (w Writer) UpsertPreserving(ctx context.Context, newRows [][]interface{}) e
 			out := make([]interface{}, numCols)
 			copy(out, ex)
 
+			// Keep track of which headers we have already updated to avoid writing duplicate columns (like Phone Number) twice.
+			updatedOwned := make(map[string]bool)
 			for i, h := range w.Headers {
 				if _, isOwned := owned[h]; isOwned {
-					out[i] = normNew[i]
+					// Only update the first occurrence of an owned header
+					if !updatedOwned[h] {
+						out[i] = normNew[i]
+						updatedOwned[h] = true
+					}
 				}
 			}
 			merged = append(merged, out)
@@ -117,6 +123,46 @@ func (w Writer) UpsertPreserving(ctx context.Context, newRows [][]interface{}) e
 		Headers:       w.Headers,
 		NumColumns:    numCols,
 	}, merged)
+}
+
+// GetExistingKeys reads the sheet and returns a map of existing Lease IDs.
+func (w Writer) GetExistingKeys(ctx context.Context) (map[string]bool, error) {
+	if w.Sheets == nil {
+		return nil, fmt.Errorf("Writer: Sheets client is nil")
+	}
+	if w.SheetTitle == "" {
+		return nil, fmt.Errorf("Writer: SheetTitle required")
+	}
+	if err := w.Sheets.EnsureSheet(ctx, w.SheetTitle); err != nil {
+		return nil, err
+	}
+
+	numCols := len(w.Headers)
+	readA1 := fmt.Sprintf("%s!A%d:%s", w.SheetTitle, w.DataRow, a1Col(numCols)+"50000")
+	existing, err := w.Sheets.ReadRange(ctx, readA1)
+	if err != nil {
+		return nil, err
+	}
+
+	keyIdx := findHeaderIndex(w.Headers, w.KeyHeader)
+	if keyIdx < 0 {
+		// Just in case it wasn't created yet or we can't find it, we'll return empty map safely
+		return map[string]bool{}, nil
+	}
+
+	keys := make(map[string]bool)
+	for _, r := range existing {
+		norm := normalizeRowLen(r, numCols)
+		if keyIdx >= len(norm) {
+			continue
+		}
+		k := keyString(norm[keyIdx])
+		if k == "" {
+			continue
+		}
+		keys[k] = true
+	}
+	return keys, nil
 }
 
 // a1Col returns column letters for 1-based col number.

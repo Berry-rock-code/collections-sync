@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Berry-rock-code/integration-hub/buildium"
@@ -27,14 +28,38 @@ type Config struct {
 }
 
 func Run(ctx context.Context, b *buildium.Client, sh *libSheets.Client, cfg Config) error {
+	fmt.Println("Step 0/4: Read existing Lease IDs from Google Sheet...")
+	w := sheets.Writer{
+		Sheets:       sh,
+		SheetTitle:   cfg.SheetTitle,
+		HeaderRow:    cfg.HeaderRow,
+		DataRow:      cfg.DataRow,
+		KeyHeader:    transform.KeyHeader(),
+		Headers:      transform.Headers(),
+		OwnedHeaders: transform.OwnedHeaders(),
+	}
+	existingKeysMap, err := w.GetExistingKeys(ctx)
+	if err != nil {
+		fmt.Printf("Warning: Failed to read existing keys (might be empty sheet): %v\n", err)
+		existingKeysMap = make(map[string]bool)
+	}
+	existingLeaseIDs := make(map[int]bool)
+	for k := range existingKeysMap {
+		if id, err := strconv.Atoi(k); err == nil {
+			existingLeaseIDs[id] = true
+		}
+	}
+	fmt.Printf("Found %d existing leases in sheet.\n\n", len(existingLeaseIDs))
+
 	fmt.Println("Step 1/4: Fetch Buildium delinquency data (balances + leases + tenant contact)...")
 
 	fetchCfg := build.FetchConfig{
-		MaxPages:      cfg.MaxPages,
-		MaxRows:       cfg.MaxRows,
-		BalTimeout:    cfg.BalTimeout,
-		LeaseTimeout:  cfg.LeaseTimeout,
-		TenantTimeout: cfg.TenantTimeout,
+		MaxPages:         cfg.MaxPages,
+		MaxRows:          cfg.MaxRows,
+		BalTimeout:       cfg.BalTimeout,
+		LeaseTimeout:     cfg.LeaseTimeout,
+		TenantTimeout:    cfg.TenantTimeout,
+		ExistingLeaseIDs: existingLeaseIDs,
 	}
 
 	rows, err := build.FetchDelinquentRows(ctx, b, fetchCfg)
@@ -48,7 +73,7 @@ func Run(ctx context.Context, b *buildium.Client, sh *libSheets.Client, cfg Conf
 	fmt.Printf("Prepared value rows: %d\n\n", len(values))
 
 	fmt.Println("Step 3/4: Upsert into Google Sheet (preserve human columns)...")
-	w := sheets.Writer{
+	w = sheets.Writer{
 		Sheets:       sh,
 		SheetTitle:   cfg.SheetTitle,
 		HeaderRow:    cfg.HeaderRow,
