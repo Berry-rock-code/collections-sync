@@ -144,7 +144,7 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 			}
 
 			// --- THE TWEAK: PRESERVE "DATE FIRST ADDED" ---
-			if isExistingRow && strings.EqualFold(strings.TrimSpace(canonical), "Date First Added") { // <-- Updated here
+			if isExistingRow && strings.EqualFold(strings.TrimSpace(canonical), "Date First Added") {
 				if m.out < len(outRow) && outRow[m.out] != nil {
 					existingVal := strings.TrimSpace(fmt.Sprint(outRow[m.out]))
 					if existingVal != "" {
@@ -215,8 +215,59 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 		endRow := startRow + len(toAppend) - 1
 		appendA1 := fmt.Sprintf("%s!%s%d:%s%d", w.SheetTitle, a1Col(0), startRow, a1Col(numCols-1), endRow)
 
+		// Write the text values
 		if err := w.Sheets.WriteRange(ctx, appendA1, toAppend); err != nil {
 			return fmt.Errorf("UpsertRows write appends: %w", err)
+		}
+
+		// === NEW: Apply Light Yellow Background to Appended Rows ===
+		// We have to fetch the numerical Sheet ID (Grid ID) for formatting requests
+		spreadsheet, err := w.Sheets.Service().Spreadsheets.Get(w.Sheets.SpreadsheetID).Context(ctx).Do()
+		if err != nil {
+			log.Printf("Warning: appended text but failed to fetch sheet info for colors: %v", err)
+			return nil // Don't fail the whole sync just because coloring failed
+		}
+
+		var targetSheetId int64 = -1
+		for _, s := range spreadsheet.Sheets {
+			if s.Properties.Title == w.SheetTitle {
+				targetSheetId = s.Properties.SheetId
+				break
+			}
+		}
+
+		if targetSheetId != -1 {
+			formatReq := &gsheets.BatchUpdateSpreadsheetRequest{
+				Requests: []*gsheets.Request{
+					{
+						RepeatCell: &gsheets.RepeatCellRequest{
+							Range: &gsheets.GridRange{
+								SheetId:          targetSheetId,
+								StartRowIndex:    int64(startRow - 1), // API uses 0-indexed rows
+								EndRowIndex:      int64(endRow),       // Exclusive bound
+								StartColumnIndex: 0,
+								EndColumnIndex:   int64(numCols),
+							},
+							Cell: &gsheets.CellData{
+								UserEnteredFormat: &gsheets.CellFormat{
+									BackgroundColor: &gsheets.Color{
+										Red:   1.0,
+										Green: 0.98,
+										Blue:  0.8, // Light Yellow
+									},
+								},
+							},
+							// This mask ensures we ONLY touch the background color, nothing else
+							Fields: "userEnteredFormat.backgroundColor",
+						},
+					},
+				},
+			}
+
+			_, err = w.Sheets.Service().Spreadsheets.BatchUpdate(w.Sheets.SpreadsheetID, formatReq).Context(ctx).Do()
+			if err != nil {
+				log.Printf("Warning: successfully appended rows but failed to color them: %v", err)
+			}
 		}
 	}
 
