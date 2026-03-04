@@ -3,8 +3,10 @@ package build
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Berry-rock-code/integration-hub/buildium"
@@ -20,8 +22,6 @@ type ActiveOwedFetchConfig struct {
 	TenantTimeout time.Duration
 	TenantSleep   time.Duration
 
-	// ExistingLeaseIDs is a map of Lease IDs currently in the Google Sheet.
-	// If a lease has a zero balance but is in this map, we process it so its balance updates to 0.
 	ExistingLeaseIDs map[int]bool
 }
 
@@ -36,8 +36,6 @@ type DelinquentRow struct {
 	AmountOwed float64
 }
 
-// FetchActiveOwedRows returns rows for active leases with a balance > 0,
-// OR leases that already exist in the sheet (to update their balances to 0).
 func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwedFetchConfig) ([]DelinquentRow, int, error) {
 	// Step A: balances
 	bCtx, cancel := context.WithTimeout(ctx, cfg.BalTimeout)
@@ -60,15 +58,24 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 		return nil, 0, fmt.Errorf("ListActiveLeases: %w", err)
 	}
 
-	// Step C: join + tenant detail lookups
-	tenantCache := make(map[int]buildium.TenantDetails)
-	var out []DelinquentRow
+	log.Printf("Scanning %d total active leases concurrently...", len(leases))
 
-	// Use a fallback timeout for tenants if it wasn't provided in the config
+	// Step C: Concurrent join + tenant detail lookups
+	var out []DelinquentRow
+	var outMutex sync.Mutex  // Protects the 'out' slice during concurrent appends
+	var tenantCache sync.Map // Thread-safe map for caching tenant details
+
 	tenantTimeout := cfg.TenantTimeout
 	if tenantTimeout == 0 {
 		tenantTimeout = 5 * time.Second
 	}
+
+	// --- CONCURRENCY SETUP ---
+	// Limit to 8 concurrent API requests to avoid Buildium rate limits.
+	// You can tune this number up or down!
+	maxWorkers := 8
+	sem := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
 
 	for _, lease := range leases {
 		owed := debtMap[lease.ID]
@@ -78,75 +85,100 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 			isExisting = cfg.ExistingLeaseIDs[lease.ID]
 		}
 
-		// Only process if they owe money, or if they are already on the sheet
-		// (meaning they might have paid off their balance and we need to update to 0).
 		if owed <= 0 && !isExisting {
 			continue
 		}
 
-		tenantID := pickActiveTenantID(lease)
-
-		// Basic address even without tenant
-		addr := leaseAddress(lease, nil)
-
-		if tenantID == 0 {
-			out = append(out, DelinquentRow{
-				LeaseID:    lease.ID,
-				Name:       "(no active tenant found)",
-				Address:    addr,
-				AmountOwed: owed,
-				Phone:      "",
-				Email:      "",
-			})
-			if cfg.MaxRows > 0 && len(out) >= cfg.MaxRows {
-				break
-			}
-			continue
-		}
-
-		td, ok := tenantCache[tenantID]
-		if !ok {
-			tCtx, cancelT := context.WithTimeout(ctx, tenantTimeout)
-			tdFetched, err := c.GetTenantDetails(tCtx, tenantID)
-			cancelT()
-			if err != nil {
-				out = append(out, DelinquentRow{
-					LeaseID:    lease.ID,
-					Name:       "(tenant lookup failed)",
-					Address:    addr,
-					AmountOwed: owed,
-				})
-				if cfg.MaxRows > 0 && len(out) >= cfg.MaxRows {
-					break
-				}
-				continue
-			}
-			if cfg.TenantSleep > 0 {
-				time.Sleep(cfg.TenantSleep)
-			}
-			td = tdFetched
-			tenantCache[tenantID] = td
-		}
-
-		addr = leaseAddress(lease, &td)
-
-		out = append(out, DelinquentRow{
-			LeaseID:    lease.ID,
-			Name:       strings.TrimSpace(td.FirstName + " " + td.LastName),
-			Address:    addr,
-			Phone:      firstPhone(td),
-			Email:      td.Email,
-			AmountOwed: owed,
-		})
-
-		if cfg.MaxRows > 0 && len(out) >= cfg.MaxRows {
+		// Check if we hit MaxRows before launching a new worker
+		outMutex.Lock()
+		reachedMax := cfg.MaxRows > 0 && len(out) >= cfg.MaxRows
+		outMutex.Unlock()
+		if reachedMax {
 			break
 		}
+
+		wg.Add(1)
+		sem <- struct{}{} // Block here if 8 workers are already busy
+
+		// Launch Goroutine
+		go func(l buildium.Lease, amountOwed float64) {
+			defer wg.Done()
+			defer func() { <-sem }() // Free up the worker slot when finished
+
+			tenantID := pickActiveTenantID(l)
+			addr := leaseAddress(l, nil)
+
+			if tenantID == 0 {
+				appendSafeRow(&out, &outMutex, DelinquentRow{
+					LeaseID:    l.ID,
+					Name:       "(no active tenant found)",
+					Address:    addr,
+					AmountOwed: amountOwed,
+				})
+				return
+			}
+
+			// Check thread-safe cache
+			var td buildium.TenantDetails
+			if cached, ok := tenantCache.Load(tenantID); ok {
+				td = cached.(buildium.TenantDetails)
+			} else {
+				// Not in cache, fetch from API
+				tCtx, cancelT := context.WithTimeout(ctx, tenantTimeout)
+				tdFetched, err := c.GetTenantDetails(tCtx, tenantID)
+				cancelT()
+
+				if err != nil {
+					appendSafeRow(&out, &outMutex, DelinquentRow{
+						LeaseID:    l.ID,
+						Name:       "(tenant lookup failed)",
+						Address:    addr,
+						AmountOwed: amountOwed,
+					})
+					return
+				}
+
+				if cfg.TenantSleep > 0 {
+					time.Sleep(cfg.TenantSleep)
+				}
+
+				td = tdFetched
+				tenantCache.Store(tenantID, td) // Store safely
+			}
+
+			addr = leaseAddress(l, &td)
+
+			appendSafeRow(&out, &outMutex, DelinquentRow{
+				LeaseID:    l.ID,
+				Name:       strings.TrimSpace(td.FirstName + " " + td.LastName),
+				Address:    addr,
+				Phone:      firstPhone(td),
+				Email:      td.Email,
+				AmountOwed: amountOwed,
+			})
+
+		}(lease, owed) // Pass variables into the goroutine to avoid closure capture bugs
 	}
+
+	// Wait for all active goroutines to finish
+	wg.Wait()
 
 	// biggest owed first
 	sort.Slice(out, func(i, j int) bool { return out[i].AmountOwed > out[j].AmountOwed })
+
+	// If concurrent appends slightly overshot MaxRows, trim it down
+	if cfg.MaxRows > 0 && len(out) > cfg.MaxRows {
+		out = out[:cfg.MaxRows]
+	}
+
 	return out, len(leases), nil
+}
+
+// Helper to safely append to our shared slice
+func appendSafeRow(out *[]DelinquentRow, mu *sync.Mutex, row DelinquentRow) {
+	mu.Lock()
+	defer mu.Unlock()
+	*out = append(*out, row)
 }
 
 func pickActiveTenantID(lease buildium.Lease) int {
