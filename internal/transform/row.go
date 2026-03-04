@@ -20,7 +20,8 @@ func ToSheetValues(rows []build.DelinquentRow) [][]interface{} {
 	}
 
 	out := make([][]interface{}, 0, len(rows))
-	now := time.Now().Format(time.RFC3339)
+	// Match the legacy Python sheet format: MM/DD/YYYY
+	now := time.Now().Format("01/02/2006")
 
 	for _, r := range rows {
 		row := make([]interface{}, len(headers))

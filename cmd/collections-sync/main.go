@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
-	"flag"
+	"encoding/json"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,69 +19,155 @@ import (
 	"github.com/Berry-rock-code/collections-sync/internal/app"
 )
 
-func main() {
-	var (
-		spreadsheetID = flag.String("spreadsheet-id", "", "Google Spreadsheet ID (required)")
-		sheetTitle    = flag.String("sheet", "Collections", "Sheet tab title")
-		maxPages      = flag.Int("max-pages", 5, "Max pages of leases to scan. Use 0 for no cap.")
-		maxRows       = flag.Int("max-rows", 0, "Max delinquent rows to write. Use 0 for no cap.")
-		timeout       = flag.Duration("timeout", 10*time.Minute, "Overall run timeout")
-
-		balTimeout    = flag.Duration("balances-timeout", 120*time.Second, "Timeout for fetching outstanding balances")
-		leaseTimeout  = flag.Duration("leases-timeout", 240*time.Second, "Timeout for fetching active leases")
-		tenantTimeout = flag.Duration("tenant-timeout", 20*time.Second, "Timeout per tenant details request")
-	)
-	flag.Parse()
-
-	config.LoadDotEnv()
-
-	if strings.TrimSpace(*spreadsheetID) == "" {
-		fmt.Fprintln(os.Stderr, "Missing --spreadsheet-id")
-		os.Exit(2)
-	}
-
-	baseURL := mustEnv("BUILDIUM_BASE_URL")
-	clientID := mustEnv("BUILDIUM_CLIENT_ID")
-	clientSecret := mustEnv("BUILDIUM_CLIENT_SECRET")
-
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-
-	bClient := buildium.New(baseURL, clientID, clientSecret, httpx.NewDefaultClient())
-
-	sClient, err := libSheets.NewClient(ctx, *spreadsheetID)
-	if err != nil {
-		fatal("Sheets client init failed", err)
-	}
-
-	cfg := app.Config{
-		SheetTitle:    *sheetTitle,
-		HeaderRow:     2,
-		DataRow:       3,
-		MaxPages:      *maxPages,
-		MaxRows:       *maxRows,
-		BalTimeout:    *balTimeout,
-		LeaseTimeout:  *leaseTimeout,
-		TenantTimeout: *tenantTimeout,
-	}
-
-	if err := app.Run(ctx, bClient, sClient, cfg); err != nil {
-		fatal("Run failed", err)
-	}
-
-	fmt.Println("Done.")
+// Matches the legacy Python Cloud Run contract:
+// request body: {"mode":"bulk"|"quick"}
+type runRequest struct {
+	Mode     string `json:"mode"`
+	MaxPages int    `json:"max_pages"`
+	MaxRows  int    `json:"max_rows"`
 }
 
-func mustEnv(key string) string {
-	v := strings.TrimSpace(os.Getenv(key))
+func main() {
+	config.LoadDotEnv()
+
+	// Env vars (prefer Python names, but accept integration-hub names too)
+	sheetID := mustEnvFirst("SHEET_ID", "SPREADSHEET_ID")
+	sheetTitle := envFirst("WORKSHEET_NAME", "SHEET_TITLE")
+	if sheetTitle == "" {
+		sheetTitle = "Collections"
+	}
+
+	baseURL := envFirst("BUILDIUM_API_URL", "BUILDIUM_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://api.buildium.com/v1"
+	}
+	clientID := mustEnvFirst("BUILDIUM_KEY", "BUILDIUM_CLIENT_ID")
+	clientSecret := mustEnvFirst("BUILDIUM_SECRET", "BUILDIUM_CLIENT_SECRET")
+
+	// Defaults (can be overridden by request JSON)
+	defaultMaxPages := envInt("MAX_PAGES", 0) // 0 = full scan
+	defaultMaxRows := envInt("MAX_ROWS", 0)
+
+	// Timeouts (kept close to your Go CLI defaults)
+	overallTimeout := envDuration("TIMEOUT", 10*time.Minute)
+	balTimeout := envDuration("BALANCES_TIMEOUT", 120*time.Second)
+	leaseTimeout := envDuration("LEASES_TIMEOUT", 240*time.Second)
+	tenantTimeout := envDuration("TENANT_TIMEOUT", 20*time.Second)
+	tenantSleep := envDuration("TENANT_SLEEP", 100*time.Millisecond)
+
+	// Create shared clients once per container instance
+	bClient := buildium.New(baseURL, clientID, clientSecret, httpx.NewDefaultClient())
+
+	ctx, cancel := context.WithTimeout(context.Background(), overallTimeout)
+	defer cancel()
+	sClient, err := libSheets.NewClient(ctx, sheetID)
+	if err != nil {
+		log.Fatalf("sheets client init failed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req runRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.MaxPages == 0 {
+			req.MaxPages = defaultMaxPages
+		}
+		if req.MaxRows == 0 {
+			req.MaxRows = defaultMaxRows
+		}
+		if strings.TrimSpace(req.Mode) == "" {
+			req.Mode = "bulk"
+		}
+
+		rCtx, rCancel := context.WithTimeout(r.Context(), overallTimeout)
+		defer rCancel()
+
+		result, err := app.Run(rCtx, bClient, sClient, app.Config{
+			SheetTitle:    sheetTitle,
+			HeaderRow:     2,
+			DataRow:       3,
+			Mode:          req.Mode,
+			MaxPages:      req.MaxPages,
+			MaxRows:       req.MaxRows,
+			BalTimeout:    balTimeout,
+			LeaseTimeout:  leaseTimeout,
+			TenantTimeout: tenantTimeout,
+			TenantSleep:   tenantSleep,
+		})
+		if err != nil {
+			log.Printf("run failed: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	addr := ":" + port
+	log.Printf("collections-sync listening on %s (sheet=%s tab=%s)", addr, sheetID, sheetTitle)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func envFirst(keys ...string) string {
+	for _, k := range keys {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func mustEnvFirst(keys ...string) string {
+	v := envFirst(keys...)
 	if v == "" {
-		fmt.Fprintf(os.Stderr, "Missing required env var: %s\n", key)
-		os.Exit(2)
+		log.Fatalf("missing required env var (one of): %s", strings.Join(keys, ", "))
 	}
 	return v
 }
 
-func fatal(msg string, err error) {
-	fmt.Fprintf(os.Stderr, "%s: %v\n", msg, err)
-	os.Exit(2)
+func envInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+// Useful for debugging in Cloud Run logs.
+func debugEnv(keys ...string) {
+	for _, k := range keys {
+		fmt.Printf("%s=%q\n", k, os.Getenv(k))
+	}
 }

@@ -18,6 +18,10 @@ type FetchConfig struct {
 	LeaseTimeout  time.Duration
 	TenantTimeout time.Duration
 
+	// TenantSleep is an optional pause after each tenant-details request
+	// to be gentle on Buildium rate limits.
+	TenantSleep time.Duration
+
 	// ExistingLeaseIDs is a map of Lease IDs currently in the Google Sheet.
 	// If a lease has a zero balance but is in this map, we process it so its balance updates to 0.
 	ExistingLeaseIDs map[int]bool
@@ -34,13 +38,13 @@ type DelinquentRow struct {
 	AmountOwed float64
 }
 
-func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfig) ([]DelinquentRow, error) {
+func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfig) ([]DelinquentRow, int, error) {
 	// Step A: balances
 	bCtx, cancel := context.WithTimeout(ctx, cfg.BalTimeout)
 	debtMap, err := c.FetchOutstandingBalances(bCtx)
 	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("FetchOutstandingBalances: %w", err)
+		return nil, 0, fmt.Errorf("FetchOutstandingBalances: %w", err)
 	}
 
 	// Step B: leases
@@ -53,7 +57,7 @@ func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfi
 	}
 	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("ListActiveLeases: %w", err)
+		return nil, 0, fmt.Errorf("ListActiveLeases: %w", err)
 	}
 
 	// Step C: join + tenant detail lookups (only for owed leases)
@@ -111,6 +115,9 @@ func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfi
 				}
 				continue
 			}
+			if cfg.TenantSleep > 0 {
+				time.Sleep(cfg.TenantSleep)
+			}
 			td = tdFetched
 			tenantCache[tenantID] = td
 		}
@@ -133,7 +140,7 @@ func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfi
 
 	// biggest owed first
 	sort.Slice(out, func(i, j int) bool { return out[i].AmountOwed > out[j].AmountOwed })
-	return out, nil
+	return out, len(leases), nil
 }
 
 func pickActiveTenantID(lease buildium.Lease) int {
