@@ -6,7 +6,7 @@ func KeyHeader() string {
 
 func Headers() []string {
 	return []string{
-		"Date Added", // <--- Added as the first item (Column A)
+		"Date First Added",
 		"Name",
 		"Address:",
 		"Phone Number",
@@ -31,16 +31,15 @@ func Headers() []string {
 		"Eviction Filed Date",
 		"Eviction Court Date",
 		"Lease ID",
-		"Phone Number", // appears twice in the list; kept for consistency with the actual sheet
+		"Phone Number",
 		"Date Status Changed to Eviction",
 	}
 }
 
 // OwnedHeaders are the columns this automation “owns” and will overwrite on upsert.
-// Everything else is preserved if the Lease ID already exists in the sheet.
 func OwnedHeaders() map[string]struct{} {
 	return map[string]struct{}{
-		"Date Added":       {}, // <--- Automation now maps this column
+		"Date First Added": {},
 		"Name":             {},
 		"Address:":         {},
 		"Phone Number":     {},
@@ -48,7 +47,5 @@ func OwnedHeaders() map[string]struct{} {
 		"Amount Owed:":     {},
 		"Lease ID":         {},
 		"Last Edited Date": {},
-		// Optional: uncomment if you want automation to manage Status too
-		// "Status": {},
 	}
 }

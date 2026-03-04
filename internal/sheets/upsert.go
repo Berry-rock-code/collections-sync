@@ -143,8 +143,8 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 				continue
 			}
 
-			// --- THE TWEAK: PRESERVE "DATE ADDED" ---
-			if isExistingRow && strings.EqualFold(strings.TrimSpace(canonical), "Date Added") {
+			// --- THE TWEAK: PRESERVE "DATE FIRST ADDED" ---
+			if isExistingRow && strings.EqualFold(strings.TrimSpace(canonical), "Date First Added") { // <-- Updated here
 				if m.out < len(outRow) && outRow[m.out] != nil {
 					existingVal := strings.TrimSpace(fmt.Sprint(outRow[m.out]))
 					if existingVal != "" {
@@ -160,7 +160,7 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 		merged = append(merged, outRow)
 	}
 
-	// === NEW: Handle Updates and Appends Manually to fix the Row Placement ===
+	// === Handle Updates and Appends Manually to fix the Row Placement ===
 	var updateRanges []*gsheets.ValueRange
 	var toAppend [][]interface{}
 
