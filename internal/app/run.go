@@ -97,17 +97,15 @@ func Run(ctx context.Context, b *buildium.Client, sh *libSheets.Client, cfg Conf
 	}
 
 	// BULK MODE
-	fetchCfg := build.FetchConfig{
+	fetchCfg := build.ActiveOwedFetchConfig{
 		MaxPages:         cfg.MaxPages,
 		MaxRows:          cfg.MaxRows,
 		BalTimeout:       cfg.BalTimeout,
 		LeaseTimeout:     cfg.LeaseTimeout,
-		TenantTimeout:    cfg.TenantTimeout,
-		TenantSleep:      cfg.TenantSleep,
 		ExistingLeaseIDs: existingLeaseIDs,
 	}
 
-	rows, leasesScanned, err := build.FetchDelinquentRows(ctx, b, fetchCfg)
+	rows, leasesScanned, err := build.FetchActiveOwedRows(ctx, b, fetchCfg)
 	if err != nil {
 		return Result{}, err
 	}

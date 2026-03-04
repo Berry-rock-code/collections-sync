@@ -10,17 +10,15 @@ import (
 	"github.com/Berry-rock-code/integration-hub/buildium"
 )
 
-type FetchConfig struct {
+// ActiveOwedFetchConfig controls bulk mode behavior.
+type ActiveOwedFetchConfig struct {
 	MaxPages int
 	MaxRows  int
 
 	BalTimeout    time.Duration
 	LeaseTimeout  time.Duration
 	TenantTimeout time.Duration
-
-	// TenantSleep is an optional pause after each tenant-details request
-	// to be gentle on Buildium rate limits.
-	TenantSleep time.Duration
+	TenantSleep   time.Duration
 
 	// ExistingLeaseIDs is a map of Lease IDs currently in the Google Sheet.
 	// If a lease has a zero balance but is in this map, we process it so its balance updates to 0.
@@ -38,7 +36,9 @@ type DelinquentRow struct {
 	AmountOwed float64
 }
 
-func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfig) ([]DelinquentRow, int, error) {
+// FetchActiveOwedRows returns rows for active leases with a balance > 0,
+// OR leases that already exist in the sheet (to update their balances to 0).
+func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwedFetchConfig) ([]DelinquentRow, int, error) {
 	// Step A: balances
 	bCtx, cancel := context.WithTimeout(ctx, cfg.BalTimeout)
 	debtMap, err := c.FetchOutstandingBalances(bCtx)
@@ -60,9 +60,15 @@ func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfi
 		return nil, 0, fmt.Errorf("ListActiveLeases: %w", err)
 	}
 
-	// Step C: join + tenant detail lookups (only for owed leases)
+	// Step C: join + tenant detail lookups
 	tenantCache := make(map[int]buildium.TenantDetails)
 	var out []DelinquentRow
+
+	// Use a fallback timeout for tenants if it wasn't provided in the config
+	tenantTimeout := cfg.TenantTimeout
+	if tenantTimeout == 0 {
+		tenantTimeout = 5 * time.Second
+	}
 
 	for _, lease := range leases {
 		owed := debtMap[lease.ID]
@@ -100,7 +106,7 @@ func FetchDelinquentRows(ctx context.Context, c *buildium.Client, cfg FetchConfi
 
 		td, ok := tenantCache[tenantID]
 		if !ok {
-			tCtx, cancelT := context.WithTimeout(ctx, cfg.TenantTimeout)
+			tCtx, cancelT := context.WithTimeout(ctx, tenantTimeout)
 			tdFetched, err := c.GetTenantDetails(tCtx, tenantID)
 			cancelT()
 			if err != nil {
