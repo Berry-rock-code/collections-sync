@@ -3,6 +3,7 @@ package sheets
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -66,7 +67,14 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 
 	keyIdx := w.findSheetIndex(sheetHeaders, w.KeyHeader)
 	if keyIdx < 0 {
-		return fmt.Errorf("Writer: key header %q not found in sheet header row", w.KeyHeader)
+		// HARD FALLBACK: your old sheet uses "Account Number" for Lease ID.
+		keyIdx = findHeaderIndexAny(sheetHeaders, []string{"Account Number"})
+	}
+	if keyIdx < 0 {
+		// Debug output (temporary)
+		log.Printf("DEBUG KeyHeader=%q HeaderRow=%d HeaderCount=%d", w.KeyHeader, w.HeaderRow, len(sheetHeaders))
+		log.Printf("DEBUG headers=%q", sheetHeaders)
+		return fmt.Errorf(`Writer: key header %q not found in sheet header row`, w.KeyHeader)
 	}
 
 	// Read existing rows (full width) so we can preserve non-owned columns.
@@ -277,9 +285,23 @@ func (w Writer) findSheetIndex(sheetHeaders []string, canonical string) int {
 	if sheetHeaders == nil {
 		return -1
 	}
+
+	canonical = strings.TrimSpace(canonical)
+
+	// Try exact alias map first
 	if aliases, ok := ColumnAliases[canonical]; ok {
 		return findHeaderIndexAny(sheetHeaders, aliases)
 	}
+
+	// Try normalized key match against ColumnAliases (covers weird casing/spaces)
+	nc := normalizeHeader(canonical)
+	for k, aliases := range ColumnAliases {
+		if normalizeHeader(k) == nc {
+			return findHeaderIndexAny(sheetHeaders, aliases)
+		}
+	}
+
+	// Final fallback: literal match
 	return findHeaderIndexAny(sheetHeaders, []string{canonical})
 }
 
@@ -289,11 +311,19 @@ func (w Writer) readSheetHeaders(ctx context.Context) ([]string, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	if len(vals) == 0 {
+	if len(vals) == 0 || len(vals[0]) == 0 {
 		return nil, 0, nil
 	}
-	headers := libSheets.ParseHeaderRow(vals[0])
-	// Find last non-empty header cell.
+
+	// IMPORTANT: do NOT use libSheets.ParseHeaderRow here because it may stop
+	// early when it hits blank header cells. Your sheet has blanks before "Account Number".
+	raw := vals[0]
+	headers := make([]string, len(raw))
+	for i, cell := range raw {
+		headers[i] = strings.TrimSpace(fmt.Sprint(cell))
+	}
+
+	// Find last non-empty header cell (so we don’t treat trailing empty columns as real).
 	last := -1
 	for i := len(headers) - 1; i >= 0; i-- {
 		if strings.TrimSpace(headers[i]) != "" {
@@ -304,6 +334,7 @@ func (w Writer) readSheetHeaders(ctx context.Context) ([]string, int, error) {
 	if last < 0 {
 		return headers, 0, nil
 	}
+
 	return headers[:last+1], last + 1, nil
 }
 
