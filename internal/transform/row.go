@@ -33,6 +33,9 @@ func ToSheetValues(rows []build.DelinquentRow) [][]interface{} {
 			}
 		}
 
+		// Inject the new DateAdded variable from the struct
+		setValue("Date Added", r.DateAdded)
+
 		setValue("Name", r.Name)
 		setValue("Address:", r.Address)
 		setValue("Phone Number", r.Phone)

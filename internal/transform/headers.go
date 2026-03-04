@@ -6,6 +6,7 @@ func KeyHeader() string {
 
 func Headers() []string {
 	return []string{
+		"Date Added", // <--- Added as the first item (Column A)
 		"Name",
 		"Address:",
 		"Phone Number",
@@ -39,6 +40,7 @@ func Headers() []string {
 // Everything else is preserved if the Lease ID already exists in the sheet.
 func OwnedHeaders() map[string]struct{} {
 	return map[string]struct{}{
+		"Date Added":       {}, // <--- Automation now maps this column
 		"Name":             {},
 		"Address:":         {},
 		"Phone Number":     {},

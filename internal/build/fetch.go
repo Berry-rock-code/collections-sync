@@ -34,6 +34,7 @@ type DelinquentRow struct {
 	Email   string
 
 	AmountOwed float64
+	DateAdded  string // <-- Here is the missing field!
 }
 
 func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwedFetchConfig) ([]DelinquentRow, int, error) {
@@ -62,8 +63,8 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 
 	// Step C: Concurrent join + tenant detail lookups
 	var out []DelinquentRow
-	var outMutex sync.Mutex  // Protects the 'out' slice during concurrent appends
-	var tenantCache sync.Map // Thread-safe map for caching tenant details
+	var outMutex sync.Mutex
+	var tenantCache sync.Map
 
 	tenantTimeout := cfg.TenantTimeout
 	if tenantTimeout == 0 {
@@ -71,11 +72,11 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 	}
 
 	// --- CONCURRENCY SETUP ---
-	// Limit to 8 concurrent API requests to avoid Buildium rate limits.
-	// You can tune this number up or down!
 	maxWorkers := 8
 	sem := make(chan struct{}, maxWorkers)
 	var wg sync.WaitGroup
+
+	todayDate := time.Now().Format("01/02/2006") // <-- Grab today's date once
 
 	for _, lease := range leases {
 		owed := debtMap[lease.ID]
@@ -114,6 +115,7 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 					Name:       "(no active tenant found)",
 					Address:    addr,
 					AmountOwed: amountOwed,
+					DateAdded:  todayDate, // <-- Injected here
 				})
 				return
 			}
@@ -134,6 +136,7 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 						Name:       "(tenant lookup failed)",
 						Address:    addr,
 						AmountOwed: amountOwed,
+						DateAdded:  todayDate, // <-- Injected here
 					})
 					return
 				}
@@ -143,7 +146,7 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 				}
 
 				td = tdFetched
-				tenantCache.Store(tenantID, td) // Store safely
+				tenantCache.Store(tenantID, td)
 			}
 
 			addr = leaseAddress(l, &td)
@@ -155,18 +158,17 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 				Phone:      firstPhone(td),
 				Email:      td.Email,
 				AmountOwed: amountOwed,
+				DateAdded:  todayDate, // <-- Injected here
 			})
 
-		}(lease, owed) // Pass variables into the goroutine to avoid closure capture bugs
+		}(lease, owed)
 	}
 
-	// Wait for all active goroutines to finish
 	wg.Wait()
 
 	// biggest owed first
 	sort.Slice(out, func(i, j int) bool { return out[i].AmountOwed > out[j].AmountOwed })
 
-	// If concurrent appends slightly overshot MaxRows, trim it down
 	if cfg.MaxRows > 0 && len(out) > cfg.MaxRows {
 		out = out[:cfg.MaxRows]
 	}
@@ -174,7 +176,6 @@ func FetchActiveOwedRows(ctx context.Context, c *buildium.Client, cfg ActiveOwed
 	return out, len(leases), nil
 }
 
-// Helper to safely append to our shared slice
 func appendSafeRow(out *[]DelinquentRow, mu *sync.Mutex, row DelinquentRow) {
 	mu.Lock()
 	defer mu.Unlock()

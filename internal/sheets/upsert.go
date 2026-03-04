@@ -19,23 +19,10 @@ type Writer struct {
 	HeaderRow  int
 	DataRow    int
 
-	// Canonical key header (our automation concept). Usually "Lease ID".
-	KeyHeader string
-
-	// OwnedHeaders are the canonical column names this automation overwrites.
-	// Everything else is preserved on upsert.
+	KeyHeader    string
 	OwnedHeaders map[string]struct{}
 }
 
-// UpsertPreserving merges newRows into the existing sheet by key, preserving
-// non-owned columns.
-//
-// Unlike the earlier implementation, this version:
-//   - does NOT overwrite the sheet's header row
-//   - dynamically maps our canonical columns to the sheet's actual header labels
-//     (Python's "dynamic column finder")
-//
-// inputHeaders describes the column ordering of newRows (typically transform.Headers()).
 func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, newRows [][]interface{}) error {
 	if w.Sheets == nil {
 		return fmt.Errorf("Writer: Sheets client is nil")
@@ -67,17 +54,14 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 
 	keyIdx := w.findSheetIndex(sheetHeaders, w.KeyHeader)
 	if keyIdx < 0 {
-		// HARD FALLBACK: your old sheet uses "Account Number" for Lease ID.
 		keyIdx = findHeaderIndexAny(sheetHeaders, []string{"Account Number"})
 	}
 	if keyIdx < 0 {
-		// Debug output (temporary)
 		log.Printf("DEBUG KeyHeader=%q HeaderRow=%d HeaderCount=%d", w.KeyHeader, w.HeaderRow, len(sheetHeaders))
 		log.Printf("DEBUG headers=%q", sheetHeaders)
 		return fmt.Errorf(`Writer: key header %q not found in sheet header row`, w.KeyHeader)
 	}
 
-	// Read existing rows (full width) so we can preserve non-owned columns.
 	readA1 := fmt.Sprintf("%s!A%d:%s", w.SheetTitle, w.DataRow, a1Col(numCols-1)+"50000")
 	existing, err := w.Sheets.ReadRange(ctx, readA1)
 	if err != nil {
@@ -99,7 +83,6 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 		}
 	}
 
-	// Build mapping: canonical header -> (input idx, sheet idx)
 	inputIdx := map[string]int{}
 	for i, h := range inputHeaders {
 		nh := normalizeHeader(h)
@@ -112,7 +95,6 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 	for k := range w.OwnedHeaders {
 		owned[k] = struct{}{}
 	}
-	// Always treat key as "owned" (we must write it for new rows).
 	owned[w.KeyHeader] = struct{}{}
 
 	type colMap struct{ in, out int }
@@ -122,15 +104,12 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 		if idx, ok := inputIdx[normalizeHeader(canonical)]; ok {
 			in = idx
 		}
-		// If input uses a different header label, allow aliases.
 		if in < 0 {
 			in = findHeaderIndexAny(inputHeaders, ColumnAliases[canonical])
 		}
 
 		out := w.findSheetIndex(sheetHeaders, canonical)
 		if out < 0 {
-			// Sheet missing this column. In bulk mode, we *could* choose to ignore,
-			// but for collections sync it's safer to fail loudly.
 			return fmt.Errorf("Writer: sheet missing required column for %q", canonical)
 		}
 		mapping[canonical] = colMap{in: in, out: out}
@@ -139,7 +118,6 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 	// Merge rows into sheet-order slices of length numCols.
 	merged := make([][]interface{}, 0, len(newRows))
 	for _, r := range newRows {
-		// Key must be present in input.
 		kIn := mapping[w.KeyHeader].in
 		if kIn < 0 || kIn >= len(r) {
 			continue
@@ -150,38 +128,101 @@ func (w Writer) UpsertPreserving(ctx context.Context, inputHeaders []string, new
 		}
 
 		var outRow []interface{}
+		isExistingRow := false
+
 		if ex, ok := existingByKey[k]; ok {
+			isExistingRow = true
 			outRow = make([]interface{}, numCols)
 			copy(outRow, ex)
 		} else {
 			outRow = make([]interface{}, numCols)
 		}
 
-		for _, m := range mapping {
+		for canonical, m := range mapping {
 			if m.in < 0 || m.in >= len(r) {
 				continue
 			}
+
+			// --- THE TWEAK: PRESERVE "DATE ADDED" ---
+			if isExistingRow && strings.EqualFold(strings.TrimSpace(canonical), "Date Added") {
+				if m.out < len(outRow) && outRow[m.out] != nil {
+					existingVal := strings.TrimSpace(fmt.Sprint(outRow[m.out]))
+					if existingVal != "" {
+						continue // Skips overwriting outRow[m.out]
+					}
+				}
+			}
+			// ----------------------------------------
+
 			outRow[m.out] = r[m.in]
 		}
 
 		merged = append(merged, outRow)
 	}
 
-	// Delegate to shared library upsert (reads header row; updates full rows; appends new keys).
-	return w.Sheets.UpsertRows(ctx, libSheets.UpsertOptions{
-		SheetTitle:    w.SheetTitle,
-		HeaderRow:     w.HeaderRow,
-		DataRow:       w.DataRow,
-		KeyHeader:     sheetHeaders[keyIdx],
-		EnsureHeaders: false,
-		NumColumns:    numCols,
-	}, merged)
+	// === NEW: Handle Updates and Appends Manually to fix the Row Placement ===
+	var updateRanges []*gsheets.ValueRange
+	var toAppend [][]interface{}
+
+	// Find the absolute last row that has data in the Lease ID column
+	maxExistingRow := w.DataRow - 1
+	keyToRowNum := make(map[string]int)
+
+	for i, r := range existing {
+		sheetRow := w.DataRow + i
+		if keyIdx < len(r) {
+			k := normalizeLeaseIDKey(keyString(r[keyIdx]))
+			if k != "" {
+				if sheetRow > maxExistingRow {
+					maxExistingRow = sheetRow
+				}
+				if _, ok := keyToRowNum[k]; !ok {
+					keyToRowNum[k] = sheetRow
+				}
+			}
+		}
+	}
+
+	// Route each merged row to either Update or Append
+	for _, outRow := range merged {
+		if keyIdx >= len(outRow) {
+			continue
+		}
+		k := normalizeLeaseIDKey(keyString(outRow[keyIdx]))
+		if rowNum, ok := keyToRowNum[k]; ok {
+			// Update existing row
+			a1 := fmt.Sprintf("%s!%s%d:%s%d", w.SheetTitle, a1Col(0), rowNum, a1Col(numCols-1), rowNum)
+			updateRanges = append(updateRanges, &gsheets.ValueRange{
+				Range:  a1,
+				Values: [][]interface{}{outRow},
+			})
+		} else {
+			// Append new row
+			toAppend = append(toAppend, outRow)
+		}
+	}
+
+	// 1. Send updates in a batch
+	if len(updateRanges) > 0 {
+		if err := BatchUpdateValues(ctx, w.Sheets.Service(), w.Sheets.SpreadsheetID, updateRanges); err != nil {
+			return fmt.Errorf("UpsertRows batch update: %w", err)
+		}
+	}
+
+	// 2. Explicitly write new rows directly under the last known Lease ID
+	if len(toAppend) > 0 {
+		startRow := maxExistingRow + 1
+		endRow := startRow + len(toAppend) - 1
+		appendA1 := fmt.Sprintf("%s!%s%d:%s%d", w.SheetTitle, a1Col(0), startRow, a1Col(numCols-1), endRow)
+
+		if err := w.Sheets.WriteRange(ctx, appendA1, toAppend); err != nil {
+			return fmt.Errorf("UpsertRows write appends: %w", err)
+		}
+	}
+
+	return nil
 }
 
-// GetExistingKeyRows returns key -> absolute row number, and the parsed header row.
-//
-// This is the foundation for "quick mode": it lets us update only Amount Owed
-// for existing rows without scanning leases.
 func (w Writer) GetExistingKeyRows(ctx context.Context) (map[string]int, []string, error) {
 	if w.Sheets == nil {
 		return nil, nil, fmt.Errorf("Writer: Sheets client is nil")
@@ -225,7 +266,6 @@ func (w Writer) GetExistingKeyRows(ctx context.Context) (map[string]int, []strin
 		if k == "" {
 			continue
 		}
-		// Keep first occurrence (avoid duplicates)
 		if _, ok := out[k]; !ok {
 			out[k] = w.DataRow + i
 		}
@@ -234,8 +274,6 @@ func (w Writer) GetExistingKeyRows(ctx context.Context) (map[string]int, []strin
 	return out, headers, nil
 }
 
-// QuickUpdateBalances updates ONLY "Amount Owed" and "Last Edited Date" for
-// keys already present in the sheet.
 func (w Writer) QuickUpdateBalances(ctx context.Context, keyToRow map[string]int, sheetHeaders []string, balances map[int]float64) (int, error) {
 	if w.Sheets == nil {
 		return 0, fmt.Errorf("Writer: Sheets client is nil")
@@ -288,12 +326,10 @@ func (w Writer) findSheetIndex(sheetHeaders []string, canonical string) int {
 
 	canonical = strings.TrimSpace(canonical)
 
-	// Try exact alias map first
 	if aliases, ok := ColumnAliases[canonical]; ok {
 		return findHeaderIndexAny(sheetHeaders, aliases)
 	}
 
-	// Try normalized key match against ColumnAliases (covers weird casing/spaces)
 	nc := normalizeHeader(canonical)
 	for k, aliases := range ColumnAliases {
 		if normalizeHeader(k) == nc {
@@ -301,7 +337,6 @@ func (w Writer) findSheetIndex(sheetHeaders []string, canonical string) int {
 		}
 	}
 
-	// Final fallback: literal match
 	return findHeaderIndexAny(sheetHeaders, []string{canonical})
 }
 
@@ -315,15 +350,12 @@ func (w Writer) readSheetHeaders(ctx context.Context) ([]string, int, error) {
 		return nil, 0, nil
 	}
 
-	// IMPORTANT: do NOT use libSheets.ParseHeaderRow here because it may stop
-	// early when it hits blank header cells. Your sheet has blanks before "Account Number".
 	raw := vals[0]
 	headers := make([]string, len(raw))
 	for i, cell := range raw {
 		headers[i] = strings.TrimSpace(fmt.Sprint(cell))
 	}
 
-	// Find last non-empty header cell (so we don’t treat trailing empty columns as real).
 	last := -1
 	for i := len(headers) - 1; i >= 0; i-- {
 		if strings.TrimSpace(headers[i]) != "" {
@@ -343,7 +375,6 @@ func normalizeLeaseIDKey(s string) string {
 	if s == "" {
 		return ""
 	}
-	// Common Sheets artifact: numeric IDs come back as "123.0".
 	if strings.Contains(s, ".") {
 		s = strings.Split(s, ".")[0]
 	}
